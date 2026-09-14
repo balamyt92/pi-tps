@@ -197,10 +197,16 @@ export default function (pi: ExtensionAPI) {
         return (rec.firstTokenMs - rec.reqSentMs) / 1000;
     }
 
-    /** Главная метрика: output / (запрос → последний токен). */
+    /**
+     * Главная метрика: output / (запрос → последний токен).
+     * Окно закрывается на ПОСЛЕДНЕМ ТОКЕНЕ (lastDeltaMs), а не на message_end:
+     * в endMs попадает post-stream оверхед (финализация сообщения), который на
+     * коротких ответах систематически занижал TPS.
+     */
     function effTps(rec: CallRecord): number | null {
         if (rec.reqSentMs === null) return null;
-        const sec = (rec.endMs - rec.reqSentMs) / 1000;
+        const lastTokenMs = rec.lastDeltaMs ?? rec.endMs;
+        const sec = (lastTokenMs - rec.reqSentMs) / 1000;
         if (sec <= 0) return null;
         return num(rec.usage?.output) / sec;
     }
@@ -218,17 +224,22 @@ export default function (pi: ExtensionAPI) {
         const ttfts: number[] = [];
 
         for (const c of records) {
-            out += num(c.usage?.output);
+            const cOut = num(c.usage?.output);
+            out += cOut;
             reasoning += num(c.usage?.reasoning);
             chars += c.textChars;
+            const t = ttft(c);
+            if (t !== null) ttfts.push(t);
+            // Время в знаменатель — только у записей с токенами. Вызов без usage
+            // (провайдер не отчитался) раздувал бы знаменатель и уронил
+            // средние TPS до бессмысленных значений.
+            if (cOut <= 0) continue;
             if (c.firstTokenMs !== null && c.lastDeltaMs !== null && c.lastDeltaMs > c.firstTokenMs) {
                 genSec += (c.lastDeltaMs - c.firstTokenMs) / 1000;
             }
             if (c.reqSentMs !== null) {
-                effSec += (c.endMs - c.reqSentMs) / 1000;
+                effSec += ((c.lastDeltaMs ?? c.endMs) - c.reqSentMs) / 1000;
             }
-            const t = ttft(c);
-            if (t !== null) ttfts.push(t);
         }
 
         return { out, reasoning, chars, genSec, effSec, ttfts };
@@ -245,7 +256,10 @@ export default function (pi: ExtensionAPI) {
 
         const wallSec = (Date.now() - runStartMs) / 1000;
         const eff = agg.effSec > 0 ? agg.out / agg.effSec : 0;
-        const lastInput = num(calls[calls.length - 1]?.usage?.input);
+        // Последний НЕНУЛЕВОЙ usage: если финальный вызов провалился без usage,
+        // «контекст 0» вводил бы в заблуждение.
+        const lastUsage = [...calls].reverse().find((c) => c.usage !== null)?.usage ?? null;
+        const lastInput = num(lastUsage?.input);
         const failedCount = calls.length - ok.length;
 
         const parts = [
