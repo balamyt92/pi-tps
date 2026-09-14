@@ -1,6 +1,6 @@
 {
   "name": "pi-tps",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Честная статистика генерации LLM (TPS, TTFT, спекулятивное декодирование) для pi",
   "keywords": ["pi-package", "pi", "tps", "tokens-per-second", "monitoring", "llm"],
   "license": "MIT",
