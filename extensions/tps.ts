@@ -13,7 +13,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  *   eff TPS  — отправка запроса → ПОСЛЕДНИЙ токен ← главная метрика
  *   decode   — первое → последнее генеративное событие (вторая метрика)
  *   gaps     — распределение интервалов между дельтами (видно берсты MTP)
- *   per-call — по КАЖДОМУ вызову отдельно, проваленные — в отдельную корзину
+ *   per-call — по КАЖДОМУ вызову отдельно; сбойные (error/aborted) и
+ *              незавершённые (pending) — в отдельную корзину, из итогов исключены
  *
  * Почему eff TPS главный (проверено на llama.cpp + MTP, июль 2025):
  * «decode window» (первый→последний токен) завышает на 1.5–3x, потому что
@@ -84,17 +85,40 @@ function isFailed(rec: CallRecord): boolean {
     return rec.stopReason === "error" || rec.stopReason === "aborted";
 }
 
+/** message_end так и не пришёл (обрыв потока) — запись не финализирована. */
+function isIncomplete(rec: CallRecord): boolean {
+    return rec.stopReason === "pending";
+}
+
+/** В итоговые агрегаты идут только финализированные успешные вызовы. */
+function isOk(rec: CallRecord): boolean {
+    return !isFailed(rec) && !isIncomplete(rec);
+}
+
 export default function (pi: ExtensionAPI) {
     let runStartMs: number | null = null;
     let calls: CallRecord[] = [];
     let pendingReqSentMs: number | null = null;
     let pendingRespAtMs: number | null = null;
+    // Семантика pi (проверено по исходникам agent-loop.js / agent-session.js):
+    //  - agent_start/agent_end эмитятся на КАЖДЫЙ low-level run: ретраи,
+    //    авто-компакция и continuation'ы (agent.continue()) перевзводят эту пару.
+    //  - agent_settled эмитится ОДИН раз за ход пользователя.
+    //  - каждое continue() — это новый provider request, поэтому before_provider_request
+    //    перевзводится и reqSentMs каждой попытки свежий; проваленная попытка —
+    //    отдельная error-запись, не портит eff TPS успешных.
+    // Значит сбрасывать накопленные данные можно только когда предыдущий ход
+    // уже устаканился, иначе ретрай посреди хода сотрёт статистику.
+    let runActive = false;
 
     pi.on("agent_start", () => {
-        runStartMs = Date.now();
-        calls = [];
-        pendingReqSentMs = null;
-        pendingRespAtMs = null;
+        if (!runActive) {
+            runStartMs = Date.now();
+            calls = [];
+            pendingReqSentMs = null;
+            pendingRespAtMs = null;
+        }
+        runActive = true;
     });
 
     pi.on("before_provider_request", () => {
@@ -181,9 +205,8 @@ export default function (pi: ExtensionAPI) {
         return num(rec.usage?.output) / sec;
     }
 
-    /** Успешные записи — только они идут в итоговые агрегаты. */
     function okCalls(): CallRecord[] {
-        return calls.filter((c) => !isFailed(c));
+        return calls.filter(isOk);
     }
 
     function aggregate(records: CallRecord[]) {
@@ -211,7 +234,8 @@ export default function (pi: ExtensionAPI) {
         return { out, reasoning, chars, genSec, effSec, ttfts };
     }
 
-    pi.on("agent_end", (_event, ctx) => {
+    pi.on("agent_settled", (_event, ctx) => {
+        runActive = false;
         if (!ctx.hasUI) return;
         if (runStartMs === null) return;
 
