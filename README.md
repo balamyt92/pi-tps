@@ -7,14 +7,14 @@
 ### Из git-репозитория
 
 ```bash
-pi install git:github.com/<user>/pi-tps@v1.1.0
+pi install git:github.com/balamyt92/pi-tps@v1.1.0
 ```
 
 Поддерживаются HTTPS и SSH:
 
 ```bash
-pi install https://github.com/<user>/pi-tps@v1.1.0
-pi install git:git@github.com:<user>/pi-tps@v1.1.0
+pi install https://github.com/balamyt92/pi-tps@v1.1.0
+pi install git:git@github.com:balamyt92/pi-tps@v1.1.0
 ```
 
 ### Из локальной папки (для разработки)
@@ -94,10 +94,18 @@ Smoke-харнес на моке ExtensionAPI с виртуальными час
 
 ## Обновление
 
+Установка запинена на тег (`@v1.1.0`). Запиненные git-ref'ы `pi update --extensions`
+и `pi update --all` **не** сдвигают на более свежий тег — они лишь пересобирают
+клон под уже настроенный ref. Чтобы перейти на новую версию — переналивка на новый ref:
+
 ```bash
-pi update pi-tps
-# или переналивка на новый ref:
-pi install git:github.com/<user>/pi-tps@v1.2.0
+pi install git:github.com/balamyt92/pi-tps@v1.2.0
+```
+
+Пересборка клона в пределах текущего запиненного ref:
+
+```bash
+pi update --extension git:github.com/balamyt92/pi-tps@v1.1.0
 ```
 
 ## Лицензия
