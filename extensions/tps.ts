@@ -52,8 +52,9 @@ function num(v: unknown): number {
     return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
+/** Единый формат чисел: точка в дробях, запятые в разрядах (dev-стандарт). */
 function fmt(n: number, digits = 0): string {
-    return n.toLocaleString("ru-RU", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    return n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
 /** Unicode-correct подсчёт символов (surrogate pairs = 1 символ). */
@@ -79,6 +80,15 @@ function maxOf(xs: number[]): number {
 
 function fmtSecOrDash(x: number | null, digits = 2): string {
     return x === null ? "—" : `${fmt(x, digits)}s`;
+}
+
+/** Русские множественные формы: 1 сбой / 2 сбоя / 5 сбоев. */
+function pluralRu(n: number, one: string, few: string, many: string): string {
+    const m10 = n % 10;
+    const m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
 }
 
 function isFailed(rec: CallRecord): boolean {
@@ -262,13 +272,21 @@ export default function (pi: ExtensionAPI) {
         const lastInput = num(lastUsage?.input);
         const failedCount = calls.length - ok.length;
 
+        const incompleteCount = calls.filter(isIncomplete).length;
+        const badTail =
+            (failedCount > 0
+                ? ` · ❌ ${fmt(failedCount)} ${pluralRu(failedCount, "сбой", "сбоя", "сбоев")}`
+                : "") +
+            (incompleteCount > 0
+                ? ` · ⚠️ ${fmt(incompleteCount)} ${pluralRu(incompleteCount, "вызов не завершён", "вызова не завершено", "вызовов не завершено")}`
+                : "");
+
         const parts = [
-            `⚡ ${fmt(eff, 1)} tok/s`,
-            `TTFT ${fmt(avg(agg.ttfts), 2)}s`,
-            `out ${fmt(agg.out)} (текст ${fmt(agg.out - agg.reasoning)})`,
-            `${fmt(agg.chars)} симв.`,
+            `⚡ ${fmt(eff, 1)} ток/с`,
+            `1-й токен ${fmt(avg(agg.ttfts), 2)}s`,
+            `${fmt(agg.out)} ток. (текст ${fmt(agg.out - agg.reasoning)})`,
             `контекст ${fmt(lastInput)}`,
-            `${fmt(wallSec, 1)}s · ${ok.length} выз.` + (failedCount > 0 ? ` (+${failedCount} сбойных)` : ""),
+            `ход ${fmt(wallSec, 1)}s · ${ok.length} выз.${badTail}`,
         ];
 
         ctx.ui.notify(parts.join(" · "), "info");
@@ -279,36 +297,53 @@ export default function (pi: ExtensionAPI) {
         handler: async (_args, ctx) => {
             if (!ctx.hasUI) return;
             if (calls.length === 0) {
-                ctx.ui.notify("Нет данных — отправь сообщение агенту.", "info");
+                ctx.ui.notify("pi-tps: нет данных — отправь сообщение агенту.", "info");
                 return;
             }
 
             const lines: string[] = [];
 
+            // ── Карточки вызовов: статус, токены, скорость, диагностика ──
             for (const c of calls) {
                 const out = num(c.usage?.output);
-                const d = decodeTps(c);
+                const hasOut = out > 0;
                 const e = effTps(c);
+                const d = decodeTps(c);
                 const t = ttft(c);
                 const reasoning = num(c.usage?.reasoning);
                 const tokPerDelta = c.deltaCount > 0 ? out / c.deltaCount : 0;
-                const flag = isFailed(c) ? " ❌" : "";
+                const status = isFailed(c)
+                    ? `❌ ${c.stopReason}`
+                    : isIncomplete(c)
+                      ? "⚠️ не завершён"
+                      : `✅ ${c.stopReason}`;
 
                 lines.push(
-                    `#${c.index}${flag}  out ${fmt(out)}  in ${fmt(num(c.usage?.input))}  ` +
-                    `eff ${e === null ? "—" : fmt(e, 1) + " tok/s"}  ` +
-                    `(decode ${fmt(d, 1)} tok/s)  ` +
-                    `TTFT ${fmtSecOrDash(t)}  ` +
-                    `${c.deltaCount} дельт (~${fmt(tokPerDelta, 2)} ток/дельта)  ` +
-                    `gaps p50 ${fmt(pct(c.gaps, 0.5))}ms p95 ${fmt(pct(c.gaps, 0.95))}ms  ` +
-                    `stop=${c.stopReason}` +
-                    (reasoning > 0 ? `  reasoning ${fmt(reasoning)}` : "")
+                    `${status}  #${c.index} — ${fmt(out)} ток. out` +
+                    (reasoning > 0 ? ` (reasoning ${fmt(reasoning)})` : "") +
+                    ` · in ${fmt(num(c.usage?.input))}`
                 );
+                lines.push(
+                    `   скорость ${e === null || !hasOut ? "—" : fmt(e, 1) + " ток/с"} · ` +
+                    `decode ${hasOut ? fmt(d, 1) : "—"} ток/с · 1-й токен ${fmtSecOrDash(t)}`
+                );
+                const charParts: string[] = [];
+                if (c.thinkingChars > 0) charParts.push(`thinking ${fmt(c.thinkingChars)}`);
+                if (c.toolCallChars > 0) charParts.push(`toolcall ${fmt(c.toolCallChars)}`);
+                lines.push(
+                    `   ${fmt(c.textChars)} симв.` +
+                    (charParts.length > 0 ? ` (+${charParts.join(" · ")})` : "") +
+                    ` · ${c.deltaCount} дельт · ~${hasOut ? fmt(tokPerDelta, 2) : "—"} ток/дельта · ` +
+                    `паузы p50 ${fmt(pct(c.gaps, 0.5))}ms / p95 ${fmt(pct(c.gaps, 0.95))}ms`
+                );
+                lines.push("");
             }
 
+            // ── Итоги по успешным вызовам ──
             const ok = okCalls();
             const agg = aggregate(ok);
-            const failedCount = calls.length - ok.length;
+            const failed = calls.filter(isFailed);
+            const incomplete = calls.filter(isIncomplete);
             const maxInput = Math.max(0, ...calls.map((c) => num(c.usage?.input)));
             const totalCacheRead = ok.reduce((a, c) => a + num(c.usage?.cacheRead), 0);
             const totalCost = ok.reduce((a, c) => a + num(c.usage?.cost?.total), 0);
@@ -316,36 +351,48 @@ export default function (pi: ExtensionAPI) {
             const decode = agg.genSec > 0 ? agg.out / agg.genSec : 0;
             const charsPerSec = agg.genSec > 0 ? agg.chars / agg.genSec : 0;
 
-            lines.push("─".repeat(60));
-            lines.push(
-                `Итого: out ${fmt(agg.out)} (текст ${fmt(agg.out - agg.reasoning)} · reasoning ${fmt(agg.reasoning)}) · ` +
-                `контекст (max) ${fmt(maxInput)} · ${fmt(agg.genSec, 1)}s генерации`
-            );
-            lines.push(`Символы: ${fmt(agg.chars)} · ${fmt(charsPerSec, 1)} зн/с`);
-            lines.push(
-                `TTFT: avg ${fmt(avg(agg.ttfts), 2)}s · max ${agg.ttfts.length > 0 ? fmt(maxOf(agg.ttfts), 2) + "s" : "—"}`
-            );
-            lines.push(`Eff TPS: ${fmt(eff, 2)} tok/s  ← запрос→последний токен (совпадает со стеной сервера)`);
-            lines.push(`Decode:  ${fmt(decode, 2)} tok/s  (первый→последний дельта; завышен из-за буфера первой дельты)`);
-            if (failedCount > 0) {
-                lines.push(`Сбойных вызовов (error/aborted): ${failedCount} — исключены из итогов`);
-            }
-
-            if (totalCacheRead > 0) {
-                lines.push(`Cache read: ${fmt(totalCacheRead)}`);
-            } else if (maxInput > 10_000) {
-                lines.push(`Cache read: 0 — сервер не отдаёт кэш-статистику в клиент`);
-            }
-            if (totalCost > 0) {
-                lines.push(`Cost: $${totalCost.toFixed(4)}`);
+            const okLabel = pluralRu(ok.length, "успешный вызов", "успешных вызова", "успешных вызовов");
+            if (ok.length === 0) {
+                lines.push("── ИТОГИ ─ нет успешных вызовов, считать нечего ─");
+            } else {
+                lines.push(`── ИТОГИ · ${fmt(ok.length)} ${okLabel} ──`);
+                lines.push(`⚡ Скорость:    ${fmt(eff, 2)} ток/с  — твоя реальная: запрос → последний токен`);
+                lines.push(
+                    `⏱  1-й токен:   ${fmt(avg(agg.ttfts), 2)}s avg` +
+                    (agg.ttfts.length > 0 ? ` · ${fmt(maxOf(agg.ttfts), 2)}s max` : "")
+                );
+                lines.push(`🔤 Токены:      ${fmt(agg.out)} out = текст ${fmt(agg.out - agg.reasoning)} + reasoning ${fmt(agg.reasoning)}`);
+                lines.push(`🗒  Контекст:    max ${fmt(maxInput)} · cache read ${fmt(totalCacheRead)}`);
+                lines.push(`💬 Символы:     ${fmt(agg.chars)} текст · ${fmt(charsPerSec, 1)} зн/с`);
+                if (totalCost > 0) {
+                    lines.push(`💰 Cost:        $${totalCost.toFixed(4)}`);
+                }
             }
 
             // Эвристика на спекулятивное декодирование.
             const totalDeltas = ok.reduce((a, c) => a + c.deltaCount, 0);
             const tokPerDelta = totalDeltas > 0 ? agg.out / totalDeltas : 0;
             if (tokPerDelta > 1.5) {
-                lines.push(`~${fmt(tokPerDelta, 2)} ток/дельта — похоже на speculative decoding (MTP)`);
+                lines.push(`🔮 ~${fmt(tokPerDelta, 2)} ток/дельта — похоже на speculative decoding (MTP)`);
             }
+            if (totalCacheRead === 0 && maxInput > 10_000) {
+                lines.push(`ℹ️  cache read 0 — сервер не отдаёт кэш-статистику в клиент`);
+            }
+
+            const excluded: string[] = [];
+            if (failed.length > 0) {
+                excluded.push(`❌ ${fmt(failed.length)} ${pluralRu(failed.length, "сбойный вызов", "сбойных вызова", "сбойных вызовов")}`);
+            }
+            if (incomplete.length > 0) {
+                excluded.push(`⚠️ ${fmt(incomplete.length)} ${pluralRu(incomplete.length, "незавершённый вызов", "незавершённых вызова", "незавершённых вызовов")}`);
+            }
+            if (excluded.length > 0) {
+                lines.push(`Исключено из итогов: ${excluded.join(" · ")}`);
+            }
+
+            lines.push("");
+            lines.push("Скорость (eff) = запрос → последний токен; совпадает с wall сервера (<5%).");
+            lines.push("Decode = 1-й → последний токен; завышен буфером 1-й дельты — только для диагностики.");
 
             ctx.ui.notify(lines.join("\n"), "info");
         },
