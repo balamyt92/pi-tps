@@ -7,15 +7,19 @@
 ### Из git-репозитория
 
 ```bash
-pi install git:github.com/balamyt92/pi-tps@v1.1.0
+pi install git:github.com/balamyt92/pi-tps
 ```
 
 Поддерживаются HTTPS и SSH:
 
 ```bash
-pi install https://github.com/balamyt92/pi-tps@v1.1.0
-pi install git:git@github.com:balamyt92/pi-tps@v1.1.0
+pi install https://github.com/balamyt92/pi-tps
+pi install git:git@github.com:balamyt92/pi-tps
 ```
+
+Без пина версии ставится последнее из default-ветки, и `pi update --extensions`
+(или `pi update --all`) продолжает её отслеживать. Если нужна конкретная
+версия — см. раздел «Обновление».
 
 ### Из локальной папки (для разработки)
 
@@ -94,19 +98,18 @@ Smoke-харнес на моке ExtensionAPI с виртуальными час
 
 ## Обновление
 
-Установка запинена на тег (`@v1.1.0`). Запиненные git-ref'ы `pi update --extensions`
-и `pi update --all` **не** сдвигают на более свежий тег — они лишь пересобирают
-клон под уже настроенный ref. Чтобы перейти на новую версию — переналивка на новый ref:
+Если установка была без ref'а (как выше), `pi update --extensions` или
+`pi update --all` подтягивает последнее из default-ветки.
+
+Если хотите зафиксировать версию — ставьте с тегом:
 
 ```bash
 pi install git:github.com/balamyt92/pi-tps@v1.2.0
 ```
 
-Пересборка клона в пределах текущего запиненного ref:
-
-```bash
-pi update --extension git:github.com/balamyt92/pi-tps@v1.1.0
-```
+Запиненный ref `pi update` на более свежий тег **не** сдвигает — он лишь
+приводит клон к настроенному ref. Для перехода на новую версию —
+переналивка на новый ref.
 
 ## Лицензия
 
