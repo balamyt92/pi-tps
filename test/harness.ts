@@ -95,6 +95,7 @@ function check(name: string, cond: boolean) {
 async function main() {
     // ───────── Сценарий 1: обычный ход, два успешных вызова ─────────
     console.log("\n═══ Сценарий 1: обычный ход (2 вызова) ═══");
+    await emit("before_agent_start"); // новый ход пользователя → сброс накопителя
     await emit("agent_start");
 
     // Вызов 1: TTFT 1.6s, eff = 100/2.1 = 47.6, decode = 100/0.5 = 200
@@ -141,7 +142,8 @@ async function main() {
 
     // ───────── Сценарий 2: ретрай посреди хода (agent_start повторно) ─────────
     console.log("\n═══ Сценарий 2: ретрай — данные не должны потеряться ═══");
-    await emit("agent_start"); // новый ход → сброс
+    await emit("before_agent_start"); // новый ход пользователя → сброс
+    await emit("agent_start"); // low-level run 1
 
     // Провальный вызов (500)
     await streamCall({
@@ -182,6 +184,7 @@ async function main() {
 
     // ───────── Сценарий 3: незавершённая запись (message_end не пришёл) ─────────
     console.log("\n═══ Сценарий 3: pending-запись ═══");
+    await emit("before_agent_start"); // новый ход → сброс
     await emit("agent_start");
     await streamCall({
         reqAt: 0,

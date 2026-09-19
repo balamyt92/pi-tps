@@ -65,7 +65,10 @@ function charLen(s: string): number {
 function pct(xs: number[], p: number): number {
     if (xs.length === 0) return 0;
     const s = [...xs].sort((a, b) => a - b);
-    return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+    // nearest-rank: ранг ceil(p*n) (1-based), минус 1 под 0-based индекс.
+    // floor(p*n) давал перекос вверх на p50: для чётного n брал верхний элемент.
+    const rank = Math.ceil(p * s.length) - 1;
+    return s[Math.max(0, Math.min(s.length - 1, rank))];
 }
 
 function avg(xs: number[]): number {
@@ -111,24 +114,28 @@ export default function (pi: ExtensionAPI) {
     let pendingReqSentMs: number | null = null;
     let pendingRespAtMs: number | null = null;
     // Семантика pi (проверено по исходникам agent-loop.js / agent-session.js):
+    //  - before_agent_start эмитится ОДИН раз на пользовательский промпт;
+    //    ретраи, авто-компакция и continuation'ы его НЕ перевзводят.
     //  - agent_start/agent_end эмитятся на КАЖДЫЙ low-level run: ретраи,
     //    авто-компакция и continuation'ы (agent.continue()) перевзводят эту пару.
     //  - agent_settled эмитится ОДИН раз за ход пользователя.
     //  - каждое continue() — это новый provider request, поэтому before_provider_request
     //    перевзводится и reqSentMs каждой попытки свежий; проваленная попытка —
     //    отдельная error-запись, не портит eff TPS успешных.
-    // Значит сбрасывать накопленные данные можно только когда предыдущий ход
-    // уже устаканился, иначе ретрай посреди хода сотрёт статистику.
-    let runActive = false;
+    // Сброс накопителя привязан к before_agent_start, а не к agent_start и не к
+    // agent_settled: так свежий ход гарантированно стартует с чистого листа
+    // независимо от того, отработал ли предыдущий agent_settled (например, после
+    // аборта), а ретрай внутри хода статистику не стирает, потому что
+    // before_agent_start не повторяется.
+    function resetRun(): void {
+        runStartMs = Date.now();
+        calls = [];
+        pendingReqSentMs = null;
+        pendingRespAtMs = null;
+    }
 
-    pi.on("agent_start", () => {
-        if (!runActive) {
-            runStartMs = Date.now();
-            calls = [];
-            pendingReqSentMs = null;
-            pendingRespAtMs = null;
-        }
-        runActive = true;
+    pi.on("before_agent_start", () => {
+        resetRun();
     });
 
     pi.on("before_provider_request", () => {
@@ -256,7 +263,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     pi.on("agent_settled", (_event, ctx) => {
-        runActive = false;
         if (!ctx.hasUI) return;
         if (runStartMs === null) return;
 

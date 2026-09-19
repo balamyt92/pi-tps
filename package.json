@@ -1,14 +1,33 @@
 {
-  "name": "pi-tps",
-  "version": "1.1.0",
-  "description": "Честная статистика генерации LLM (TPS, TTFT, спекулятивное декодирование) для pi",
-  "keywords": ["pi-package", "pi", "tps", "tokens-per-second", "monitoring", "llm"],
-  "license": "MIT",
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
-  },
-  "pi": {
-    "extensions": ["./extensions"]
-  }
+	"name": "pi-tps",
+	"version": "1.2.0",
+	"description": "Честная статистика генерации LLM (TPS, TTFT, спекулятивное декодирование) для pi",
+	"keywords": ["pi-package", "pi", "tps", "tokens-per-second", "monitoring", "llm"],
+	"type": "module",
+	"license": "MIT",
+	"engines": {
+		"node": ">=20.0.0"
+	},
+	"files": [
+		"extensions",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test": "node test/harness.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.7.0"
+	},
+	"pi": {
+		"extensions": ["./extensions"]
+	}
 }
