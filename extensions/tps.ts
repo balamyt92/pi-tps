@@ -98,6 +98,19 @@ function isFailed(rec: CallRecord): boolean {
     return rec.stopReason === "error" || rec.stopReason === "aborted";
 }
 
+/**
+ * Порог «токенов на дельту», выше которого ответ похож на спекулятивное
+ * декодирование (MTP и родственные).
+ *
+ * Смысл: при обычном декодировании провайдер отдаёт ~1 токен на дельту.
+ * Когда сервер добирает токены черновиком, в один SSE-чанк попадает несколько
+ * токенов, и отношение `output / deltaCount` растёт. 1.5 — нижняя граница,
+ * с которой отношение уже нельзя объяснить округлением на одно-двухтокенных
+ * дельтах. Порог грубый и намеренно консервативный: он для подписи
+ * «похоже на спекуляции», а не для измерения.
+ */
+const SPECULATIVE_TOK_PER_DELTA_THRESHOLD = 1.5;
+
 /** message_end так и не пришёл (обрыв потока) — запись не финализирована. */
 function isIncomplete(rec: CallRecord): boolean {
     return rec.stopReason === "pending";
@@ -113,12 +126,46 @@ export default function (pi: ExtensionAPI) {
     let calls: CallRecord[] = [];
     let pendingReqSentMs: number | null = null;
     let pendingRespAtMs: number | null = null;
+
+    /**
+     * Запись, открытая текущим потоком: поставлена на `message_start`,
+     * закрыта и обнулена на `message_end`; дополнительно обнуляется на
+     * `agent_end` (см. ниже).
+     *
+     * Почему нельзя ключевать по id сообщения или по идентичности объекта.
+     * Проверено по исходникам `pi-agent-core/dist/agent-loop.js` и типам
+     * `pi-ai`:
+     *   - `AssistantMessage` не имеет стабильного `id`
+     *     (`pi-ai/dist/types.d.ts:307-329`). `responseId` опционален и у
+     *     части провайдеров отсутствует вовсе; `timestamp` имеет
+     *     миллисекундную грануляцию. Оба ненадёжны как ключ в пределах хода.
+     *   - `message_start` и каждый `message_update` эмиттируют
+     *     `{ ...partialMessage }` — НОВЫЙ экземпляр на каждое событие
+     *     (`agent-loop.js:248` и `:265`; там же `:279` и `:292` — тот же
+     *     spread для `{ ...finalMessage }`). Идентичность объекта между
+     *     событиями не выполняется.
+     *
+     * Явный `openRecord` строго лучше чтения `calls[calls.length - 1]`:
+     * он не даёт финализировать уже закрытую запись. Если `message_end`
+     * придёт без предшествующего `message_start` (расширение подключилось
+     * посреди потока после `/reload`, либо провайдер с непарным потоком),
+     * раньше он перезаписал `usage`/`stopReason` предыдущей корректной
+     * записи. Теперь такой вызов просто игнорируется, а предыдущая запись
+     * остаётся нетронутой.
+     */
+    let openRecord: CallRecord | null = null;
     // Семантика pi (проверено по исходникам agent-loop.js / agent-session.js):
-    //  - before_agent_start эмитится ОДИН раз на пользовательский промпт;
-    //    ретраи, авто-компакция и continuation'ы его НЕ перевзводят.
+    //  - before_agent_start — ровно ОДИН call site (agent-session.js:1025), в
+    //    preflight-блоке prompt() до _runAgentPrompt. Ретраи, авто-компакция и
+    //    agent.continue() его НЕ перевзводят.
+    //    ВАЖНО: сообщения, доставленные через steer()/followUp() или
+    //    sendCustomMessage({ triggerTurn }), идут в обход before_agent_start
+    //    вовсе. Окно статистики = один ход пользователя ВКЛЮЧАЯ стиринг и
+    //    follow-up'ы внутри него; они накопление не сбрасывают.
     //  - agent_start/agent_end эмитятся на КАЖДЫЙ low-level run: ретраи,
     //    авто-компакция и continuation'ы (agent.continue()) перевзводят эту пару.
-    //  - agent_settled эмитится ОДИН раз за ход пользователя.
+    //  - agent_settled эмитится ОДИН раз за ход пользователя (finally в
+    //    _runAgentPrompt, agent-session.js:877).
     //  - каждое continue() — это новый provider request, поэтому before_provider_request
     //    перевзводится и reqSentMs каждой попытки свежий; проваленная попытка —
     //    отдельная error-запись, не портит eff TPS успешных.
@@ -132,6 +179,7 @@ export default function (pi: ExtensionAPI) {
         calls = [];
         pendingReqSentMs = null;
         pendingRespAtMs = null;
+        openRecord = null;
     }
 
     pi.on("before_agent_start", () => {
@@ -150,7 +198,7 @@ export default function (pi: ExtensionAPI) {
 
     pi.on("message_start", (event) => {
         if (!isAssistantMessage(event.message)) return;
-        calls.push({
+        const record: CallRecord = {
             index: calls.length + 1,
             reqSentMs: pendingReqSentMs,
             respAtMs: pendingRespAtMs,
@@ -164,7 +212,9 @@ export default function (pi: ExtensionAPI) {
             gaps: [],
             usage: null,
             stopReason: "pending",
-        });
+        };
+        calls.push(record);
+        openRecord = record;
     });
 
     pi.on("message_update", (event) => {
@@ -175,7 +225,7 @@ export default function (pi: ExtensionAPI) {
         const delta = ev?.delta ?? "";
         if (!delta) return;
 
-        const rec = calls[calls.length - 1];
+        const rec = openRecord;
         if (!rec) return;
 
         const now = Date.now();
@@ -195,11 +245,32 @@ export default function (pi: ExtensionAPI) {
 
     pi.on("message_end", (event) => {
         if (!isAssistantMessage(event.message)) return;
-        const rec = calls[calls.length - 1];
+        const rec = openRecord;
+        // Нет открытой записи → `message_end` без пары `message_start`.
+        // Не финализируем предыдущую запись: она уже закрыта и корректна.
         if (!rec) return;
         rec.usage = event.message.usage ?? null;
         rec.stopReason = event.message.stopReason ?? "unknown";
         rec.endMs = Date.now();
+        openRecord = null;
+    });
+
+    /**
+     * Конец low-level run'а закрывает незакрытую запись.
+     *
+     * При обрыве потока `message_end` может не прийти, и `openRecord`
+     * останется висеть на оборванной записи. Без этого сброса блуждающий
+     * `message_end`, пришедший после `agent_end` но до следующего
+     * `message_start`, финализировал бы оборванную запись чужими
+     * `usage`/`stopReason` — и она выбыла бы из корзины незавершённых прямо
+     * в итоги.
+     *
+     * Легитимную финализацию сброс не «съедает»: `message_end` всегда
+     * предшествует `agent_end` внутри того же run'а, поэтому к моменту
+     * `agent_end` открытой записи уже нет.
+     */
+    pi.on("agent_end", () => {
+        openRecord = null;
     });
 
     function decodeTps(rec: CallRecord): number {
@@ -363,6 +434,7 @@ export default function (pi: ExtensionAPI) {
             } else {
                 lines.push(`── ИТОГИ · ${fmt(ok.length)} ${okLabel} ──`);
                 lines.push(`⚡ Скорость:    ${fmt(eff, 2)} ток/с  — твоя реальная: запрос → последний токен`);
+                lines.push(`⏳ Decode:      ${fmt(decode, 2)} ток/с  — 1-й → последний токен, завышен буфером`);
                 lines.push(
                     `⏱  1-й токен:   ${fmt(avg(agg.ttfts), 2)}s avg` +
                     (agg.ttfts.length > 0 ? ` · ${fmt(maxOf(agg.ttfts), 2)}s max` : "")
@@ -378,7 +450,7 @@ export default function (pi: ExtensionAPI) {
             // Эвристика на спекулятивное декодирование.
             const totalDeltas = ok.reduce((a, c) => a + c.deltaCount, 0);
             const tokPerDelta = totalDeltas > 0 ? agg.out / totalDeltas : 0;
-            if (tokPerDelta > 1.5) {
+            if (tokPerDelta > SPECULATIVE_TOK_PER_DELTA_THRESHOLD) {
                 lines.push(`🔮 ~${fmt(tokPerDelta, 2)} ток/дельта — похоже на speculative decoding (MTP)`);
             }
             if (totalCacheRead === 0 && maxInput > 10_000) {

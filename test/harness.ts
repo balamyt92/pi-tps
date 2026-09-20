@@ -200,6 +200,58 @@ async function main() {
     await commands.get("tps")!.handler("", ctx);
     check("/tps помечает ⚠️ не завершён", (notifications[0] ?? "").includes("⚠️ не завершён"));
 
+    // ───────── Сценарий 4: message_end без пары message_start ─────────
+    console.log("\n═══ Сценарий 4: stray message_end не портит закрытую запись ═══");
+    await emit("before_agent_start");
+    await emit("agent_start");
+    await streamCall({
+        reqAt: 0,
+        respDelay: 500,
+        deltas: textDeltas(10, 40),
+        usage: { input: 1000, output: 100, cacheRead: 0, cacheWrite: 0 },
+        stopReason: "stop",
+    });
+
+    // Блуждающий message_end без предшествующего message_start.
+    // До openRecord он перезаписал бы usage/stopReason записи #1.
+    advance(100);
+    await emit("message_end", {
+        message: assistantMsg({ usage: { input: 999, output: 999 }, stopReason: "error" }),
+    });
+
+    notifications.length = 0;
+    await commands.get("tps")!.handler("", ctx);
+    const r4 = notifications[0] ?? "";
+    check("#1 остался ✅ stop (не стал error)", r4.includes("✅ stop") && r4.includes("#1"));
+    check("stray-событие не создало запись #2", !r4.includes("#2"));
+    check("output #1 остался 100 (не 999)", r4.includes("100 ток. out") && !r4.includes("999"));
+
+    // ───────── Сценарий 5: agent_end закрывает оборванную запись ─────────
+    console.log("\n═══ Сценарий 5: обрыв потока + agent_end ═══");
+    await emit("before_agent_start");
+    await emit("agent_start");
+    // Вызов оборвался: message_start был, message_end не пришёл.
+    await streamCall({
+        reqAt: 0,
+        respDelay: 500,
+        deltas: textDeltas(5, 40),
+        emitEnd: false,
+    });
+    await emit("agent_end", { messages: [] }); // обязан закрыть openRecord
+
+    // Блуждающий message_end ПОСЛЕ agent_end.
+    advance(100);
+    await emit("message_end", {
+        message: assistantMsg({ usage: { input: 777, output: 777 }, stopReason: "stop" }),
+    });
+
+    notifications.length = 0;
+    await commands.get("tps")!.handler("", ctx);
+    const r5 = notifications[0] ?? "";
+    check("оборванная запись осталась ⚠️ не завершён", r5.includes("⚠️ не завершён"));
+    check("stray message_end не вписал 777", !r5.includes("777"));
+    check("успешных итогов нет (все вызовы в корзине)", r5.includes("нет успешных вызовов"));
+
     // ───────── Итог ─────────
     console.log(`\n${failures === 0 ? "✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ" : `❌ ПРОВАЛЕНО ПРОВЕРОК: ${failures}`}`);
     process.exit(failures === 0 ? 0 : 1);
