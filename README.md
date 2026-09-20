@@ -94,7 +94,7 @@ Decode = 1-й → последний токен; завышен буфером 1
 node test/harness.ts
 ```
 
-Smoke-харнес на моке ExtensionAPI с виртуальными часами: обычный ход, ретрай посреди хода, незавершённый стрим. Работает на нативном type-stripping Node 24 (расширение использует только `import type`).
+Smoke-харнес на моке ExtensionAPI с виртуальными часами: обычный ход, ретрай посреди хода, незавершённый стрим, stray `message_end` без пары, обрыв потока с `agent_end`. Работает на нативном type-stripping Node 24 (расширение использует только `import type`).
 
 ## Обновление
 
@@ -104,7 +104,7 @@ Smoke-харнес на моке ExtensionAPI с виртуальными час
 Если хотите зафиксировать версию — ставьте с тегом:
 
 ```bash
-pi install git:github.com/balamyt92/pi-tps@v1.2.0
+pi install git:github.com/balamyt92/pi-tps@v1.3.0
 ```
 
 Запиненный ref `pi update` на более свежий тег **не** сдвигает — он лишь
