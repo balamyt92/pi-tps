@@ -1,6 +1,9 @@
 // Smoke-харнес pi-tps: мок ExtensionAPI + виртуальные часы.
 // Запуск: node test/harness.ts
 // Сценарии: 1) обычный ход из двух вызовов 2) ретрай посреди хода 3) pending + /tps
+// 4) stray message_end 5) обрыв + agent_end
+// 6) граничные случаи метрики «контекст»: кэш, компакция, неизмеримый ход,
+//    согласованность баз entryFill/prevFill, обрыв без agent_settled
 
 let clock = 1_000_000;
 Date.now = () => clock;
@@ -87,9 +90,42 @@ function textDeltas(n: number, gap: number, prefix = "word") {
 }
 
 let failures = 0;
-function check(name: string, cond: boolean) {
-    console.log(`${cond ? "✔" : "✘"} ${name}`);
+function check(name: string, cond: boolean, actual?: unknown) {
+    console.log(`${cond ? "✔" : "✘"} ${name}${cond ? "" : ` — факт: ${JSON.stringify(actual)}`}`);
     if (!cond) failures++;
+}
+
+// Один полный самодостаточный ход: before_agent_start (+ опциональный prompt
+// пользователя) → agent_start → run → agent_settled; возвращает уведомление.
+async function notifyOnce(run: () => Promise<void>, userPrompt?: string): Promise<string> {
+    await emit("before_agent_start", userPrompt === undefined ? {} : { prompt: userPrompt });
+    await emit("agent_start");
+    await run();
+    notifications.length = 0;
+    await emit("agent_settled");
+    return notifications[0] ?? "";
+}
+
+const growthOf = (s: string): string => s.match(/контекст (\S+)/)?.[1] ?? "(нет)";
+
+// Калибровка без межсценарных зависимостей: первый ход устанавливает базу
+// baseFill (prompt = baseFill−100, output = 100), второй ход даёт curUsage;
+// возвращается процент из уведомления второго хода (база — prevFill).
+async function growthFrom(baseFill: number, curUsage: Record<string, unknown>): Promise<string> {
+    await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: baseFill - 100, output: 100, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    });
+    return growthOf(await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: curUsage,
+            stopReason: "stop",
+        });
+    }));
 }
 
 async function main() {
@@ -129,7 +165,14 @@ async function main() {
     const n1 = notifications.length;
     await emit("agent_settled");
     check("agent_settled дал ровно одно уведомление", notifications.length === n1 + 1);
-    check("уведомление содержит скорость и 1-й токен", /⚡ .* ток\/с/.test(notifications[n1]) && notifications[n1].includes("1-й токен"));
+    check(
+        "уведомление: скорость, TTFT, out/think, контекст +37% (первый ход считается сразу), ход 8.1s",
+        /⚡ .* ток\/с/.test(notifications[n1]) &&
+            notifications[n1].includes("TTFT") &&
+            notifications[n1].includes("350 out / 20 think") &&
+            notifications[n1].includes("контекст +37%") &&
+            notifications[n1].includes("ход 8.1s")
+    );
     check("нет упоминания сбоев", !notifications[n1].includes("сбой"));
 
     // /tps по сценарию 1: корректные множественные формы и суммарный cache read
@@ -142,7 +185,17 @@ async function main() {
 
     // ───────── Сценарий 2: ретрай посреди хода (agent_start повторно) ─────────
     console.log("\n═══ Сценарий 2: ретрай — данные не должны потеряться ═══");
-    await emit("before_agent_start"); // новый ход пользователя → сброс
+    // Явная установка базы: наполнение 2050 (1200+600+0+250), чтобы сценарий 2
+    // не зависел от фикстур сценария 1 (prevFill снимается на следующем
+    // before_agent_start).
+    await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(25, 30),
+            usage: { input: 1200, output: 250, cacheRead: 600, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    });
+    await emit("before_agent_start"); // новый ход пользователя → prevFill = 2050
     await emit("agent_start"); // low-level run 1
 
     // Провальный вызов (500)
@@ -159,12 +212,14 @@ async function main() {
     advance(2000); // backoff
     await emit("agent_start"); // повторный low-level run — НЕ должен стереть вызовы
 
-    // Успешный вызов после ретрая
+    // Успешный вызов после ретрая. Наполнение = промпт+output = (1600+500+0)+100 = 2200.
+    // База (прошлый ход) = (1200+600+0)+250 = 2050 → (2200−2050)/2050 = +7%.
+    // Формула = (после − до)/до, как в эталоне пользователя 100k→110k = +10%.
     await streamCall({
         reqAt: 0,
         respDelay: 700,
         deltas: textDeltas(20, 50),
-        usage: { input: 1300, output: 100, cacheRead: 500, cacheWrite: 0 },
+        usage: { input: 1600, output: 100, cacheRead: 500, cacheWrite: 0 },
         stopReason: "stop",
     });
 
@@ -172,6 +227,7 @@ async function main() {
     await emit("agent_settled");
     check("после ретрая уведомление есть", notifications.length === n2 + 1);
     check("сбой показан в уведомлении", notifications[n2].includes("❌ 1 сбой"));
+    check("контекст +7% от прошлого наполнения (2050→2200, с cacheRead)", notifications[n2].includes("контекст +7%"));
 
     // /tps должен показать оба вызова
     notifications.length = 0;
@@ -251,6 +307,143 @@ async function main() {
     check("оборванная запись осталась ⚠️ не завершён", r5.includes("⚠️ не завершён"));
     check("stray message_end не вписал 777", !r5.includes("777"));
     check("успешных итогов нет (все вызовы в корзине)", r5.includes("нет успешных вызовов"));
+
+    // ───────── Сценарий 6: граничные случаи метрики «контекст» ─────────
+    console.log("\n═══ Сценарий 6: метрика «контекст» — границы ═══");
+
+    // 6.1 Эталон пользователя: 100k → 110k = +10% (prevFill-ветка)
+    const g61 = await growthFrom(100_000, { input: 1000, output: 10_000, cacheRead: 99_000, cacheWrite: 0 });
+    check("6.1 эталон 100k→110k = +10%", g61 === "+10%", g61);
+
+    // 6.2 input=0, весь вход в кэше: база считается (ловит мутацию «input<=0 → 0»)
+    const g62 = await growthFrom(10_000, { input: 0, output: 100, cacheRead: 10_900, cacheWrite: 0 });
+    check("6.2 input=0, весь вход в кэше (10000→11000) = +10%", g62 === "+10%", g62);
+
+    // 6.3 cacheWrite входит в наполнение (ловит удаление слагаемого из promptOf)
+    const g63 = await growthFrom(10_000, { input: 0, output: 100, cacheRead: 0, cacheWrite: 10_900 });
+    check("6.3 cacheWrite входит в наполнение (10000→11000) = +10%", g63 === "+10%", g63);
+
+    // 6.4 компакция: промпт упал — минус на знаке
+    const g64 = await growthFrom(10_000, { input: 500, output: 100, cacheRead: 3_400, cacheWrite: 0 });
+    check("6.4 компакция 10000→4000 = −60%", g64 === "-60%", g64);
+
+    // 6.5 наполнение не измерено (prompt=0 во всех вызовах) → «—»
+    const g65 = await growthFrom(10_000, { input: 0, output: 100, cacheRead: 0, cacheWrite: 0 });
+    check("6.5 prompt=0 → «—»", g65 === "—", g65);
+
+    // 6.6 usage без cache-полей: prompt = input
+    const g66 = await growthFrom(10_000, { input: 10_900, output: 100 });
+    check("6.6 usage без cache-полей: prompt = input (10000→11000) = +10%", g66 === "+10%", g66);
+
+    // 6.7 последний вызов отчитался только output'ом (prompt=0) → «—»,
+    // а не устаревшее наполнение предыдущего вызова
+    await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: 10_000, output: 100, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }); // fill = 10100
+    const g67 = growthOf(await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: 10_100, output: 100, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "toolUse",
+        });
+        await streamCall({
+            deltas: textDeltas(20, 20),
+            usage: { input: 0, output: 500, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }));
+    check("6.7 вызов с output без промпта → «—» (не откат к прошлому вызову)", g67 === "—", g67);
+
+    // 6.8 согласованность базы: ход 1 (entryFill − оценка сообщения) и ход 2
+    // (prevFill) при одинаковом содержательном приросте дают одинаковый процент.
+    // Ход 1: старый контекст 10000 + сообщение 500 ток. (2000 симв.) + ответ 200.
+    // База = 10500 − 500 = 10000 → рост 700/10000 = +7%.
+    const g68a = growthOf(await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: 10_500, output: 200, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }, "x".repeat(2000)));
+    // Ход 2: база prevFill = 10700, снова сообщение 500 + ответ 200 → fill 11400
+    // → 700/10700 = 6.5% → +7%.
+    const g68b = growthOf(await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: 11_200, output: 200, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }, "x".repeat(2000)));
+    check("6.8 ход1 (entryFill−msg) и ход2 (prevFill) при равном приросте: оба +7%",
+        g68a === "+7%" && g68b === "+7%", [g68a, g68b]);
+
+    // 6.9 неизмеримый ход обнуляет базу: следующий ход показывает свой
+    // прирост, а не накопленный с момента последнего измерения
+    await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: 10_000, output: 100, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }); // fill = 10100
+    await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(20, 20),
+            usage: { input: 0, output: 4_000, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }); // неизмерим (prompt=0) → prevFill обязан стать null
+    const g69 = growthOf(await notifyOnce(async () => {
+        await streamCall({
+            deltas: textDeltas(10, 20),
+            usage: { input: 14_100, output: 100, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+        });
+    }));
+    // База = entryFill = 14100 (prevFill null), fill = 14200 → 0.7% → +1%.
+    // С протухшей базой 10100 было бы +41%.
+    check("6.9 неизмеримый ход не оставляет протухшую базу (+1%, не +41%)", g69 === "+1%", g69);
+
+    // 6.10 ход без agent_settled (обрыв): снимок prevFill в before_agent_start
+    // уцелевает — ровно то, ради чего снимок привязан к before_agent_start
+    await emit("before_agent_start", {});
+    await emit("agent_start");
+    await streamCall({
+        deltas: textDeltas(10, 20),
+        usage: { input: 1_500, output: 100, cacheRead: 0, cacheWrite: 0 },
+        stopReason: "stop",
+    });
+    // agent_settled НЕ эмитим — ход оборвался
+    await emit("before_agent_start", {}); // resetRun обязан снять prevFill = 1600
+    await emit("agent_start");
+    await streamCall({
+        deltas: textDeltas(10, 20),
+        usage: { input: 1_600, output: 100, cacheRead: 0, cacheWrite: 0 },
+        stopReason: "stop",
+    });
+    notifications.length = 0;
+    await emit("agent_settled");
+    const g610 = growthOf(notifications[0] ?? "");
+    check("6.10 обрыв без agent_settled: база 1600 уцелела → +6%", g610 === "+6%", g610);
+
+    // 6.11 пустой ход (before_agent_start без вызовов) базу не ломает:
+    // следующий ход считает от своего entryFill
+    await emit("before_agent_start", {}); // пустой ход: prevFill = turnFill([]) = null
+    await emit("before_agent_start", {});
+    await emit("agent_start");
+    await streamCall({
+        deltas: textDeltas(10, 20),
+        usage: { input: 1_700, output: 100, cacheRead: 0, cacheWrite: 0 },
+        stopReason: "stop",
+    });
+    notifications.length = 0;
+    await emit("agent_settled");
+    const g611 = growthOf(notifications[0] ?? "");
+    check("6.11 пустой ход не ломает базу: следующий от entryFill 1700 → +6%", g611 === "+6%", g611);
 
     // ───────── Итог ─────────
     console.log(`\n${failures === 0 ? "✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ" : `❌ ПРОВАЛЕНО ПРОВЕРОК: ${failures}`}`);

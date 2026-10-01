@@ -126,6 +126,17 @@ export default function (pi: ExtensionAPI) {
     let calls: CallRecord[] = [];
     let pendingReqSentMs: number | null = null;
     let pendingRespAtMs: number | null = null;
+    // Наполнение разговора по итогам ПРЕДЫДУЩЕГО хода: promptOf + output =
+    // input + cacheRead + cacheWrite + output последнего отчитавшегося вызова.
+    // Переживает resetRun: снимается в начале нового хода, до очистки `calls`.
+    // База для процента прироста. Сбрасывается безусловно, включая null:
+    // неизмеримый ход обязан обнулить базу, иначе следующий ход припишет себе
+    // накопленный рост нескольких ходов (см. resetRun).
+    let prevFill: number | null = null;
+    // Оценка сообщения пользователя в токенах (~4 символа на токен) из события
+    // before_agent_start. Вычитается из entryFill на ходе, где prevFill === null,
+    // чтобы база первого хода совпадала по смыслу с prevFill (без нового сообщения).
+    let userMsgTokens: number | null = null;
 
     /**
      * Запись, открытая текущим потоком: поставлена на `message_start`,
@@ -174,7 +185,12 @@ export default function (pi: ExtensionAPI) {
     // независимо от того, отработал ли предыдущий agent_settled (например, после
     // аборта), а ретрай внутри хода статистику не стирает, потому что
     // before_agent_start не повторяется.
-    function resetRun(): void {
+    function resetRun(userPrompt: string | null): void {
+        // Снять наполнение завершённого хода ДО очистки — это база для % прироста.
+        // Сброс безусловный: null тоже записывается, чтобы просроченная база
+        // не переживала неизмеримый ход и не растягивала окно прироста.
+        prevFill = turnFill(calls);
+        userMsgTokens = userPrompt === null ? null : Math.round(charLen(userPrompt) / 4);
         runStartMs = Date.now();
         calls = [];
         pendingReqSentMs = null;
@@ -182,8 +198,9 @@ export default function (pi: ExtensionAPI) {
         openRecord = null;
     }
 
-    pi.on("before_agent_start", () => {
-        resetRun();
+    pi.on("before_agent_start", (event) => {
+        const prompt = (event as { prompt?: unknown }).prompt;
+        resetRun(typeof prompt === "string" ? prompt : null);
     });
 
     pi.on("before_provider_request", () => {
@@ -333,6 +350,69 @@ export default function (pi: ExtensionAPI) {
         return { out, reasoning, chars, genSec, effSec, ttfts };
     }
 
+    /** Промпт вызова = весь вход: input + cacheRead + cacheWrite. */
+    function promptOf(rec: CallRecord): number {
+        const u = rec.usage;
+        if (!u) return 0;
+        return num(u.input) + num(u.cacheRead) + num(u.cacheWrite);
+    }
+
+    /**
+     * Наполнение разговора по итогам вызова: промпт + ответ.
+     * cacheRead обязателен: при промпт-кэшировании основной объём диалога
+     * лежит в cacheRead, а `input` — только некэшированный остаток; без
+     * cacheRead база занижалась в разы и процент раздувался (+84% вместо ~1%).
+     */
+    function fillOf(rec: CallRecord): number | null {
+        const p = promptOf(rec);
+        if (p <= 0) return null;
+        return p + num(rec.usage?.output);
+    }
+
+    /**
+     * Наполнение хода: fillOf последнего вызова, отчитавшегося usage.
+     * Если у такого вызова промпт нулевой (отчитан только output — типично
+     * для OpenAI-совместимых прокси без prompt_tokens), наполнение считается
+     * неизмеренным (null). Прежний откат к более раннему вызову тихо
+     * подставлял устаревшее число и переносил ошибку через prevFill на
+     * следующий ход в противоположную сторону.
+     */
+    function turnFill(records: CallRecord[]): number | null {
+        const last = [...records].reverse().find((c) => c.usage !== null);
+        return last ? fillOf(last) : null;
+    }
+
+    /**
+     * «Старая» часть разговора на входе в ход = промпт первого вызова.
+     * База, когда prevFill нет (первый ход после /reload или неизмеримый
+     * прошлый ход): старый контекст уже виден во входе первого запроса,
+     * поэтому процент считается сразу. Из базы вычитается userMsgTokens —
+     * оценка сообщения пользователя этого хода, — иначе оно попадало в
+     * знаменатель первого хода и в числитель последующих, и одинаковый
+     * прирост давал разные проценты.
+     */
+    function entryFill(records: CallRecord[]): number | null {
+        const first = records.find((c) => promptOf(c) > 0);
+        return first ? promptOf(first) : null;
+    }
+
+    /**
+     * Прирост разговора за ход в % от базы:
+     * (cur − prev) / prev × 100. Ход, добавивший токены, даёт > 0;
+     * минус возможен только при реальной компакции. `—` если база null/<=0
+     * или наполнение не измерено (ни один вызов не отчитался промптом).
+     */
+    function growthLabel(prev: number | null, cur: number | null): string {
+        if (prev === null || prev <= 0 || cur === null) return "контекст —";
+        const p = ((cur - prev) / prev) * 100;
+        // Знак берётся после округления: микроспадение не печатаем как «-0%».
+        // Процент без разрядных разделителей: «+1,727%» в русской строке
+        // читается как +1.7% и искажает число на три порядка.
+        const r = Math.round(Math.abs(p));
+        const sign = p < 0 && r > 0 ? "-" : "+";
+        return `контекст ${sign}${r}%`;
+    }
+
     pi.on("agent_settled", (_event, ctx) => {
         if (!ctx.hasUI) return;
         if (runStartMs === null) return;
@@ -341,12 +421,15 @@ export default function (pi: ExtensionAPI) {
         const agg = aggregate(ok);
         if (agg.out <= 0) return;
 
-        const wallSec = (Date.now() - runStartMs) / 1000;
         const eff = agg.effSec > 0 ? agg.out / agg.effSec : 0;
-        // Последний НЕНУЛЕВОЙ usage: если финальный вызов провалился без usage,
-        // «контекст 0» вводил бы в заблуждение.
-        const lastUsage = [...calls].reverse().find((c) => c.usage !== null)?.usage ?? null;
-        const lastInput = num(lastUsage?.input);
+        const wallSec = (Date.now() - runStartMs) / 1000;
+        // База: наполнение прошлого хода (prevFill). Если его нет (первый ход
+        // после /reload или прошлый ход не измерился) — «старая» часть
+        // разговора на входе: промпт первого вызова минус оценка сообщения
+        // пользователя, чтобы база совпадала по смыслу с prevFill.
+        const entry = entryFill(calls);
+        const base = prevFill ?? (entry === null ? null : Math.max(0, entry - (userMsgTokens ?? 0)));
+        const growth = growthLabel(base, turnFill(calls));
         const failedCount = calls.length - ok.length;
 
         const incompleteCount = calls.filter(isIncomplete).length;
@@ -360,10 +443,10 @@ export default function (pi: ExtensionAPI) {
 
         const parts = [
             `⚡ ${fmt(eff, 1)} ток/с`,
-            `1-й токен ${fmt(avg(agg.ttfts), 2)}s`,
-            `${fmt(agg.out)} ток. (текст ${fmt(agg.out - agg.reasoning)})`,
-            `контекст ${fmt(lastInput)}`,
-            `ход ${fmt(wallSec, 1)}s · ${ok.length} выз.${badTail}`,
+            `TTFT ${fmt(avg(agg.ttfts), 2)}s`,
+            `${fmt(agg.out)} out / ${fmt(agg.reasoning)} think`,
+            growth,
+            `${ok.length} выз. · ход ${fmt(wallSec, 1)}s${badTail}`,
         ];
 
         ctx.ui.notify(parts.join(" · "), "info");
@@ -421,7 +504,10 @@ export default function (pi: ExtensionAPI) {
             const agg = aggregate(ok);
             const failed = calls.filter(isFailed);
             const incomplete = calls.filter(isIncomplete);
-            const maxInput = Math.max(0, ...calls.map((c) => num(c.usage?.input)));
+            // Полный промпт (input + cacheRead + cacheWrite), как в метрике
+            // «контекст +N%» уведомления; сырой input под тем же словом
+            // «контекст» давал два разных определения в одном отчёте.
+            const maxPrompt = Math.max(0, ...calls.map((c) => promptOf(c)));
             const totalCacheRead = ok.reduce((a, c) => a + num(c.usage?.cacheRead), 0);
             const totalCost = ok.reduce((a, c) => a + num(c.usage?.cost?.total), 0);
             const eff = agg.effSec > 0 ? agg.out / agg.effSec : 0;
@@ -440,7 +526,7 @@ export default function (pi: ExtensionAPI) {
                     (agg.ttfts.length > 0 ? ` · ${fmt(maxOf(agg.ttfts), 2)}s max` : "")
                 );
                 lines.push(`🔤 Токены:      ${fmt(agg.out)} out = текст ${fmt(agg.out - agg.reasoning)} + reasoning ${fmt(agg.reasoning)}`);
-                lines.push(`🗒  Контекст:    max ${fmt(maxInput)} · cache read ${fmt(totalCacheRead)}`);
+                lines.push(`🗒  Контекст:    max ${fmt(maxPrompt)} · cache read ${fmt(totalCacheRead)}`);
                 lines.push(`💬 Символы:     ${fmt(agg.chars)} текст · ${fmt(charsPerSec, 1)} зн/с`);
                 if (totalCost > 0) {
                     lines.push(`💰 Cost:        $${totalCost.toFixed(4)}`);
@@ -453,7 +539,7 @@ export default function (pi: ExtensionAPI) {
             if (tokPerDelta > SPECULATIVE_TOK_PER_DELTA_THRESHOLD) {
                 lines.push(`🔮 ~${fmt(tokPerDelta, 2)} ток/дельта — похоже на speculative decoding (MTP)`);
             }
-            if (totalCacheRead === 0 && maxInput > 10_000) {
+            if (totalCacheRead === 0 && maxPrompt > 10_000) {
                 lines.push(`ℹ️  cache read 0 — сервер не отдаёт кэш-статистику в клиент`);
             }
 
