@@ -397,20 +397,24 @@ export default function (pi: ExtensionAPI) {
     }
 
     /**
-     * Прирост разговора за ход в % от базы:
-     * (cur − prev) / prev × 100. Ход, добавивший токены, даёт > 0;
-     * минус возможен только при реальной компакции. `—` если база null/<=0
-     * или наполнение не измерено (ни один вызов не отчитался промптом).
+     * Заполнение контекстного окна в процентах.
      */
-    function growthLabel(prev: number | null, cur: number | null): string {
-        if (prev === null || prev <= 0 || cur === null) return "контекст —";
-        const p = ((cur - prev) / prev) * 100;
-        // Знак берётся после округления: микроспадение не печатаем как «-0%».
-        // Процент без разрядных разделителей: «+1,727%» в русской строке
-        // читается как +1.7% и искажает число на три порядка.
-        const r = Math.round(Math.abs(p));
-        const sign = p < 0 && r > 0 ? "-" : "+";
-        return `контекст ${sign}${r}%`;
+    function fillPct(fill: number, ctxWindow: number): number {
+        return ctxWindow > 0 ? (fill / ctxWindow) * 100 : 0;
+    }
+
+    /**
+     * Прирост заполнения контекстного окна в процентных пунктах.
+     *
+     * Формула: (cur − prev) / ctxWindow × 100.
+     * Показывает только дельту, без текущего процента — он уже виден в футере.
+     * `—` если база или наполнение не измерены.
+     */
+    function contextGrowthLabel(base: number | null, cur: number | null, ctxWindow: number): string {
+        if (cur === null || base === null || base <= 0 || ctxWindow <= 0) return "заполнение —";
+        const delta = fillPct(cur, ctxWindow) - fillPct(base, ctxWindow);
+        const sign = delta >= 0 ? "+" : "";
+        return `заполнение ${sign}${fmt(delta, 1)}%`;
     }
 
     pi.on("agent_settled", (_event, ctx) => {
@@ -429,7 +433,10 @@ export default function (pi: ExtensionAPI) {
         // пользователя, чтобы база совпадала по смыслу с prevFill.
         const entry = entryFill(calls);
         const base = prevFill ?? (entry === null ? null : Math.max(0, entry - (userMsgTokens ?? 0)));
-        const growth = growthLabel(base, turnFill(calls));
+        const contextWindow =
+            ctx.model?.contextWindow ??
+            (Number(process.env.PI_TPS_CONTEXT_WINDOW) || 0);
+        const growth = contextGrowthLabel(base, turnFill(calls), contextWindow);
         const failedCount = calls.length - ok.length;
 
         const incompleteCount = calls.filter(isIncomplete).length;

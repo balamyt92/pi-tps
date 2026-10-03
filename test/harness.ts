@@ -106,12 +106,22 @@ async function notifyOnce(run: () => Promise<void>, userPrompt?: string): Promis
     return notifications[0] ?? "";
 }
 
-const growthOf = (s: string): string => s.match(/контекст (\S+)/)?.[1] ?? "(нет)";
+// Извлекает дельту заполнения из формата:
+//   "заполнение +M%" → "+M%"
+//   "заполнение —"  → "—"
+const growthOf = (s: string): string => {
+    if (s.includes("заполнение —")) return "—";
+    const m = s.match(/заполнение ([+-]?[\d.]+)%/);
+    return m ? `${m[1]}%` : "(нет)";
+};
 
-// Калибровка без межсценарных зависимостей: первый ход устанавливает базу
-// baseFill (prompt = baseFill−100, output = 100), второй ход даёт curUsage;
-// возвращается процент из уведомления второго хода (база — prevFill).
+// Калибровка: первый ход устанавливает базу (baseFill−100 prompt + 100 output),
+// второй ход даёт curUsage; возвращается дельта заполнения окна (п.п.) из
+// уведомления второго хода. Для воспроизводимости фиксируем PI_TPS_CONTEXT_WINDOW.
+/** Тестовое окно для воспроизводимых процентов в сценариях. */
+const TEST_CTX_WINDOW = 20000;
 async function growthFrom(baseFill: number, curUsage: Record<string, unknown>): Promise<string> {
+    process.env.PI_TPS_CONTEXT_WINDOW = String(TEST_CTX_WINDOW);
     await notifyOnce(async () => {
         await streamCall({
             deltas: textDeltas(10, 20),
@@ -129,6 +139,10 @@ async function growthFrom(baseFill: number, curUsage: Record<string, unknown>): 
 }
 
 async function main() {
+    // Фиксируем окно для всех сценариев. Без этого ctx.model?.contextWindow
+    // в моке undefined, и метрика заполнения будет «—».
+    process.env.PI_TPS_CONTEXT_WINDOW = String(TEST_CTX_WINDOW);
+
     // ───────── Сценарий 1: обычный ход, два успешных вызова ─────────
     console.log("\n═══ Сценарий 1: обычный ход (2 вызова) ═══");
     await emit("before_agent_start"); // новый ход пользователя → сброс накопителя
@@ -166,11 +180,11 @@ async function main() {
     await emit("agent_settled");
     check("agent_settled дал ровно одно уведомление", notifications.length === n1 + 1);
     check(
-        "уведомление: скорость, TTFT, out/think, контекст +37% (первый ход считается сразу), ход 8.1s",
+        "уведомление: скорость, TTFT, out/think, заполнение, ход 8.1s",
         /⚡ .* ток\/с/.test(notifications[n1]) &&
             notifications[n1].includes("TTFT") &&
             notifications[n1].includes("350 out / 20 think") &&
-            notifications[n1].includes("контекст +37%") &&
+            notifications[n1].includes("заполнение") &&
             notifications[n1].includes("ход 8.1s")
     );
     check("нет упоминания сбоев", !notifications[n1].includes("сбой"));
@@ -227,7 +241,7 @@ async function main() {
     await emit("agent_settled");
     check("после ретрая уведомление есть", notifications.length === n2 + 1);
     check("сбой показан в уведомлении", notifications[n2].includes("❌ 1 сбой"));
-    check("контекст +7% от прошлого наполнения (2050→2200, с cacheRead)", notifications[n2].includes("контекст +7%"));
+    check("заполнение показано", notifications[n2].includes("заполнение"));
 
     // /tps должен показать оба вызова
     notifications.length = 0;
@@ -308,35 +322,37 @@ async function main() {
     check("stray message_end не вписал 777", !r5.includes("777"));
     check("успешных итогов нет (все вызовы в корзине)", r5.includes("нет успешных вызовов"));
 
-    // ───────── Сценарий 6: граничные случаи метрики «контекст» ─────────
-    console.log("\n═══ Сценарий 6: метрика «контекст» — границы ═══");
+    // ───────── Сценарий 6: граничные случаи метрики «заполнение» ─────────
+    console.log("\n═══ Сценарий 6: метрика «заполнение» — границы ═══");
 
-    // 6.1 Эталон пользователя: 100k → 110k = +10% (prevFill-ветка)
+    // Все сценарии 6.x используют фиксированное окно для воспроизводимости.
+    process.env.PI_TPS_CONTEXT_WINDOW = String(TEST_CTX_WINDOW);
+
+    // 6.1 Эталон: 100k → 110k, окно 20k → 500% → 550% = +50.0%
     const g61 = await growthFrom(100_000, { input: 1000, output: 10_000, cacheRead: 99_000, cacheWrite: 0 });
-    check("6.1 эталон 100k→110k = +10%", g61 === "+10%", g61);
+    check("6.1 эталон 100k→110k = +50.0%", g61 === "+50.0%", g61);
 
-    // 6.2 input=0, весь вход в кэше: база считается (ловит мутацию «input<=0 → 0»)
+    // 6.2 input=0, весь вход в кэше: 10k→11k, окно 20k → 50%→55% = +5.0%
     const g62 = await growthFrom(10_000, { input: 0, output: 100, cacheRead: 10_900, cacheWrite: 0 });
-    check("6.2 input=0, весь вход в кэше (10000→11000) = +10%", g62 === "+10%", g62);
+    check("6.2 input=0, весь вход в кэше (10000→11000) = +5.0%", g62 === "+5.0%", g62);
 
-    // 6.3 cacheWrite входит в наполнение (ловит удаление слагаемого из promptOf)
+    // 6.3 cacheWrite входит в наполнение: 10k→11k = +5.0%
     const g63 = await growthFrom(10_000, { input: 0, output: 100, cacheRead: 0, cacheWrite: 10_900 });
-    check("6.3 cacheWrite входит в наполнение (10000→11000) = +10%", g63 === "+10%", g63);
+    check("6.3 cacheWrite входит в наполнение (10000→11000) = +5.0%", g63 === "+5.0%", g63);
 
-    // 6.4 компакция: промпт упал — минус на знаке
+    // 6.4 компакция: промпт упал 10k→4k, окно 20k → 50%→20% = −30.0%
     const g64 = await growthFrom(10_000, { input: 500, output: 100, cacheRead: 3_400, cacheWrite: 0 });
-    check("6.4 компакция 10000→4000 = −60%", g64 === "-60%", g64);
+    check("6.4 компакция 10000→4000 = −30.0%", g64 === "-30.0%", g64);
 
     // 6.5 наполнение не измерено (prompt=0 во всех вызовах) → «—»
     const g65 = await growthFrom(10_000, { input: 0, output: 100, cacheRead: 0, cacheWrite: 0 });
     check("6.5 prompt=0 → «—»", g65 === "—", g65);
 
-    // 6.6 usage без cache-полей: prompt = input
+    // 6.6 usage без cache-полей: prompt = input. 10k→11k = +5.0%
     const g66 = await growthFrom(10_000, { input: 10_900, output: 100 });
-    check("6.6 usage без cache-полей: prompt = input (10000→11000) = +10%", g66 === "+10%", g66);
+    check("6.6 usage без cache-полей: prompt = input (10000→11000) = +5.0%", g66 === "+5.0%", g66);
 
-    // 6.7 последний вызов отчитался только output'ом (prompt=0) → «—»,
-    // а не устаревшее наполнение предыдущего вызова
+    // 6.7 последний вызов отчитался только output'ом (prompt=0) → «—»
     await notifyOnce(async () => {
         await streamCall({
             deltas: textDeltas(10, 20),
@@ -359,9 +375,9 @@ async function main() {
     check("6.7 вызов с output без промпта → «—» (не откат к прошлому вызову)", g67 === "—", g67);
 
     // 6.8 согласованность базы: ход 1 (entryFill − оценка сообщения) и ход 2
-    // (prevFill) при одинаковом содержательном приросте дают одинаковый процент.
+    // (prevFill) при одинаковом содержательном приросте дают одинаковую дельту.
     // Ход 1: старый контекст 10000 + сообщение 500 ток. (2000 симв.) + ответ 200.
-    // База = 10500 − 500 = 10000 → рост 700/10000 = +7%.
+    // База = 10500 − 500 = 10000. fill = 10700. Окно 20k → 50.0%→53.5% = +3.5%.
     const g68a = growthOf(await notifyOnce(async () => {
         await streamCall({
             deltas: textDeltas(10, 20),
@@ -369,8 +385,8 @@ async function main() {
             stopReason: "stop",
         });
     }, "x".repeat(2000)));
-    // Ход 2: база prevFill = 10700, снова сообщение 500 + ответ 200 → fill 11400
-    // → 700/10700 = 6.5% → +7%.
+    // Ход 2: база prevFill = 10700, снова сообщение 500 + ответ 200 → fill 11400.
+    // 53.5%→57.0% = +3.5%.
     const g68b = growthOf(await notifyOnce(async () => {
         await streamCall({
             deltas: textDeltas(10, 20),
@@ -378,11 +394,12 @@ async function main() {
             stopReason: "stop",
         });
     }, "x".repeat(2000)));
-    check("6.8 ход1 (entryFill−msg) и ход2 (prevFill) при равном приросте: оба +7%",
-        g68a === "+7%" && g68b === "+7%", [g68a, g68b]);
+    check("6.8 ход1 (entryFill−msg) и ход2 (prevFill) при равном приросте: оба +3.5%",
+        g68a === "+3.5%" && g68b === "+3.5%", [g68a, g68b]);
 
-    // 6.9 неизмеримый ход обнуляет базу: следующий ход показывает свой
-    // прирост, а не накопленный с момента последнего измерения
+    // 6.9 неизмеримый ход обнуляет базу: следующий ход показывает
+    // прирост от своего entryFill. fill=14200, entryFill=14100, окно 20k.
+    // 70.5%→71.0% = +0.5%. С протухшей базой было бы +41% старого образца.
     await notifyOnce(async () => {
         await streamCall({
             deltas: textDeltas(10, 20),
@@ -404,12 +421,10 @@ async function main() {
             stopReason: "stop",
         });
     }));
-    // База = entryFill = 14100 (prevFill null), fill = 14200 → 0.7% → +1%.
-    // С протухшей базой 10100 было бы +41%.
-    check("6.9 неизмеримый ход не оставляет протухшую базу (+1%, не +41%)", g69 === "+1%", g69);
+    check("6.9 неизмеримый ход не оставляет протухшую базу (+0.5%, не +41%)", g69 === "+0.5%", g69);
 
     // 6.10 ход без agent_settled (обрыв): снимок prevFill в before_agent_start
-    // уцелевает — ровно то, ради чего снимок привязан к before_agent_start
+    // уцелевает. fill 1600→1700, окно 20k → 8.0%→8.5% = +0.5%.
     await emit("before_agent_start", {});
     await emit("agent_start");
     await streamCall({
@@ -428,10 +443,10 @@ async function main() {
     notifications.length = 0;
     await emit("agent_settled");
     const g610 = growthOf(notifications[0] ?? "");
-    check("6.10 обрыв без agent_settled: база 1600 уцелела → +6%", g610 === "+6%", g610);
+    check("6.10 обрыв без agent_settled: база 1600 уцелела → +0.5%", g610 === "+0.5%", g610);
 
-    // 6.11 пустой ход (before_agent_start без вызовов) базу не ломает:
-    // следующий ход считает от своего entryFill
+    // 6.11 пустой ход (before_agent_start без вызовов) базу не ломает.
+    // entryFill=1700, fill=1800, окно 20k → 8.5%→9.0% = +0.5%.
     await emit("before_agent_start", {}); // пустой ход: prevFill = turnFill([]) = null
     await emit("before_agent_start", {});
     await emit("agent_start");
@@ -443,7 +458,7 @@ async function main() {
     notifications.length = 0;
     await emit("agent_settled");
     const g611 = growthOf(notifications[0] ?? "");
-    check("6.11 пустой ход не ломает базу: следующий от entryFill 1700 → +6%", g611 === "+6%", g611);
+    check("6.11 пустой ход не ломает базу: следующий от entryFill 1700 → +0.5%", g611 === "+0.5%", g611);
 
     // ───────── Итог ─────────
     console.log(`\n${failures === 0 ? "✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ" : `❌ ПРОВАЛЕНО ПРОВЕРОК: ${failures}`}`);
